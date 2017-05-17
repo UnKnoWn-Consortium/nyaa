@@ -301,7 +301,7 @@ class SubCategory(db.Model):
 class Comment(db.Model):
     __tablename__ = DB_TABLE_PREFIX + 'comments'
 
-    id = db.Column(db.Integer, primary_key=True)
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     torrent = db.Column(db.Integer, db.ForeignKey(
         DB_TABLE_PREFIX + 'torrents.id'), primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey(

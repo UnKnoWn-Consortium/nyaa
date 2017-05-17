@@ -183,8 +183,6 @@ def search(term='', user=None, sort='id', order='desc', category='0_0', quality_
 
     return query
 
->>>>>>> Added comments
-
 @app.errorhandler(404)
 def not_found(error):
     return flask.render_template('404.html'), 404

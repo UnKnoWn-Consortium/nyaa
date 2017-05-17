@@ -131,6 +131,9 @@ class CommentForm(FlaskForm):
 
     is_anonymous = BooleanField('Anonymous')
 
+    if app.config['USE_RECAPTCHA']:
+        recaptcha = RecaptchaField()
+
 
 class EditForm(FlaskForm):
     display_name = TextField('Torrent display name', [
