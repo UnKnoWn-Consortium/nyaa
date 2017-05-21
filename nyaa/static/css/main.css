@@ -9,6 +9,18 @@
 	content:"\e080";
 }
 
+.table-tool-bar #date-filter {
+	text-align: left;
+}
+
+.table-tool-bar #top-pagination {
+	text-align: right;
+}
+
+.table-tool-bar nav ul.pagination {
+	margin: 0;
+}
+
 .torrent-list > tbody > tr > td {
 	vertical-align: middle;
 	white-space: nowrap;

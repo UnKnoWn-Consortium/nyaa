@@ -9,6 +9,20 @@
 </th>
 {% endmacro %}
 {% if (use_elastic and torrent_query.hits.total > 0) or (torrent_query.items) %}
+<div class="table-tool-bar row">
+	<div class="col-md-6" id="date-filter">
+
+	</div>
+	<div class="col-md-6" id="top-pagination">
+		{% if use_elastic %}
+		{{ pagination.info }}
+		{{ pagination.links }}
+		{% else %}
+		{% from "bootstrap/pagination.html" import render_pagination %}
+		{{ render_pagination(torrent_query) }}
+		{% endif %}
+	</div>
+</div>
 <div class="table-responsive">
 	<table class="table table-bordered table-hover table-striped torrent-list">
 		<thead>
@@ -99,7 +113,7 @@
 <h3>No results found</h3>
 {% endif %}
 
-<center>
+<div style="text-align: center">
 	{% if use_elastic %}
 	{{ pagination.info }}
 	{{ pagination.links }}
@@ -107,4 +121,4 @@
 	{% from "bootstrap/pagination.html" import render_pagination %}
 	{{ render_pagination(torrent_query) }}
 	{% endif %}
-</center>
+</div>
