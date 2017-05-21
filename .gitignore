@@ -10,3 +10,6 @@ uwsgi.sock
 /test_torrent_batch
 config.py
 torrents
+.idea/workspace.xml
+*.xml
+.idea/nyaa.iml
