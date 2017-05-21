@@ -11,7 +11,7 @@ import config
 
 import json
 from datetime import datetime, timedelta
-import ipaddress
+from ipaddress import ip_address
 import os.path
 import base64
 from urllib.parse import quote
@@ -62,6 +62,12 @@ def filter_truthy(input_list):
     return [item for item in input_list if item]
 
 
+@app.template_global()
+def category_name(cat_id):
+    ''' Given a category id (eg. 1_2), returns a category name (eg. Anime - English-translated) '''
+    return ' - '.join(get_category_id_map().get(cat_id, ['???']))
+
+
 @app.errorhandler(404)
 def not_found(error):
     return flask.render_template('404.html'), 404
@@ -110,27 +116,65 @@ def get_utc_timestamp(datetime_str):
 def get_display_time(datetime_str):
     return datetime.strptime(datetime_str, '%Y-%m-%dT%H:%M:%S').strftime('%Y-%m-%d %H:%M')
 
+
+@utils.cached_function
+def get_category_id_map():
+    ''' Reads database for categories and turns them into a dict with
+        ids as keys and name list as the value, ala
+        {'1_0': ['Anime'], '1_2': ['Anime', 'English-translated'], ...} '''
+    cat_id_map = {}
+    for main_cat in models.MainCategory.query:
+        cat_id_map[main_cat.id_as_string] = [main_cat.name]
+        for sub_cat in main_cat.sub_categories:
+            cat_id_map[sub_cat.id_as_string] = [main_cat.name, sub_cat.name]
+    return cat_id_map
+
+
 # Routes start here #
 
+
 app.register_blueprint(api_handler.api_blueprint, url_prefix='/api')
+
+
+def chain_get(source, *args):
+    ''' Tries to return values from source by the given keys.
+        Returns None if none match.
+        Note: can return a None from the source. '''
+    sentinel = object()
+    for key in args:
+        value = source.get(key, sentinel)
+        if value is not sentinel:
+            return value
+    return None
+
 
 @app.route('/rss', defaults={'rss': True})
 @app.route('/', defaults={'rss': False})
 def home(rss):
-    if flask.request.args.get('page') == 'rss':
-        rss = True
+    render_as_rss = rss
+    req_args = flask.request.args
+    if req_args.get('page') == 'rss':
+        render_as_rss = True
 
-    term = flask.request.args.get('q', flask.request.args.get('term'))
-    sort = flask.request.args.get('s')
-    order = flask.request.args.get('o')
-    category = flask.request.args.get('c', flask.request.args.get('cats'))
-    quality_filter = flask.request.args.get('f', flask.request.args.get('filter'))
-    user_name = flask.request.args.get('u', flask.request.args.get('user'))
-    page = flask.request.args.get('p', flask.request.args.get('offset', 1, int), int)
+    search_term = chain_get(req_args, 'q', 'term')
 
-    per_page = app.config.get('RESULTS_PER_PAGE')
-    if not per_page:
-        per_page = DEFAULT_PER_PAGE
+    sort_key = req_args.get('s')
+    sort_order = req_args.get('o')
+
+    category = chain_get(req_args, 'c', 'cats')
+    quality_filter = chain_get(req_args, 'f', 'filter')
+
+    user_name = chain_get(req_args, 'u', 'user')
+    page_number = chain_get(req_args, 'p', 'page', 'offset')
+    try:
+        page_number = max(1, int(page_number))
+    except (ValueError, TypeError):
+        page_number = 1
+
+    # Check simply if the key exists
+    use_magnet_links = 'magnets' in req_args or 'm' in req_args
+
+    results_per_page = app.config.get('RESULTS_PER_PAGE', DEFAULT_PER_PAGE)
 
     user_id = None
     if user_name:
@@ -141,44 +185,43 @@ def home(rss):
 
     query_args = {
         'user': user_id,
-        'sort': sort or 'id',
-        'order': order or 'desc',
+        'sort': sort_key or 'id',
+        'order': sort_order or 'desc',
         'category': category or '0_0',
         'quality_filter': quality_filter or '0',
-        'page': page,
-        'rss': rss,
-        'per_page': per_page
+        'page': page_number,
+        'rss': render_as_rss,
+        'per_page': results_per_page
     }
 
     if flask.g.user:
         query_args['logged_in_user'] = flask.g.user
-        if flask.g.user.is_admin:  # God mode
+        if flask.g.user.is_moderator:  # God mode
             query_args['admin'] = True
 
     # If searching, we get results from elastic search
     use_elastic = app.config.get('USE_ELASTIC_SEARCH')
-    if use_elastic and term:
-        query_args['term'] = term
+    if use_elastic and search_term:
+        query_args['term'] = search_term
 
-        max_search_results = app.config.get('ES_MAX_SEARCH_RESULT')
-        if not max_search_results:
-            max_search_results = DEFAULT_MAX_SEARCH_RESULT
+        max_search_results = app.config.get('ES_MAX_SEARCH_RESULT', DEFAULT_MAX_SEARCH_RESULT)
 
         # Only allow up to (max_search_results / page) pages
-        max_page = min(query_args['page'], int(math.ceil(max_search_results / float(per_page))))
+        max_page = min(query_args['page'], int(math.ceil(max_search_results / results_per_page)))
 
         query_args['page'] = max_page
         query_args['max_search_results'] = max_search_results
 
         query_results = search_elastic(**query_args)
 
-        if rss:
-            return render_rss('/', query_results, use_elastic=True)
+        if render_as_rss:
+            return render_rss('"{}"'.format(search_term), query_results, use_elastic=True, magnet_links=use_magnet_links)
         else:
-            rss_query_string = _generate_query_string(term, category, quality_filter, user_name)
+            rss_query_string = _generate_query_string(
+                search_term, category, quality_filter, user_name)
             max_results = min(max_search_results, query_results['hits']['total'])
             # change p= argument to whatever you change page_parameter to or pagination breaks
-            pagination = Pagination(p=query_args['page'], per_page=per_page,
+            pagination = Pagination(p=query_args['page'], per_page=results_per_page,
                                     total=max_results, bs_version=3, page_parameter='p',
                                     display_msg=SERACH_PAGINATE_DISPLAY_MSG)
             return flask.render_template('home.html',
@@ -192,13 +235,14 @@ def home(rss):
         if use_elastic:
             query_args['term'] = ''
         else:  # Otherwise, use db search for everything
-            query_args['term'] = term or ''
+            query_args['term'] = search_term or ''
 
         query = search_db(**query_args)
-        if rss:
-            return render_rss('/', query, use_elastic=False)
+        if render_as_rss:
+            return render_rss('Home', query, use_elastic=False, magnet_links=use_magnet_links)
         else:
-            rss_query_string = _generate_query_string(term, category, quality_filter, user_name)
+            rss_query_string = _generate_query_string(
+                search_term, category, quality_filter, user_name)
             # Use elastic is always false here because we only hit this section
             # if we're browsing without a search term (which means we default to DB)
             # or if ES is disabled
@@ -216,77 +260,75 @@ def view_user(user_name):
     if not user:
         flask.abort(404)
 
-    if flask.g.user and flask.g.user.id != user.id:
-        admin = flask.g.user.is_admin
-        superadmin = flask.g.user.is_superadmin
-    else:
-        admin = False
-        superadmin = False
+    admin_form = None
+    if flask.g.user and flask.g.user.is_moderator and flask.g.user.level > user.level:
+        admin_form = forms.UserForm()
+        default, admin_form.user_class.choices = _create_user_class_choices(user)
+        if flask.request.method == 'GET':
+            admin_form.user_class.data = default
 
-    form = forms.UserForm()
-    form.user_class.choices = _create_user_class_choices()
-    if flask.request.method == 'POST' and form.validate():
-        selection = form.user_class.data
+    if flask.request.method == 'POST' and admin_form and admin_form.validate():
+        selection = admin_form.user_class.data
 
         if selection == 'regular':
             user.level = models.UserLevelType.REGULAR
         elif selection == 'trusted':
             user.level = models.UserLevelType.TRUSTED
+        elif selection == 'moderator':
+            user.level = models.UserLevelType.MODERATOR
+
         db.session.add(user)
         db.session.commit()
 
-        return flask.redirect('/user/' + user.username)
+        return flask.redirect(flask.url_for('view_user', user_name=user.username))
 
-    level = 'Regular'
-    if user.is_admin:
-        level = 'Moderator'
-    if user.is_superadmin:  # check this second because user can be admin AND superadmin
-        level = 'Administrator'
-    elif user.is_trusted:
-        level = 'Trusted'
+    user_level = ['Regular', 'Trusted', 'Moderator', 'Administrator'][user.level]
 
-    term = flask.request.args.get('q')
-    sort = flask.request.args.get('s')
-    order = flask.request.args.get('o')
-    category = flask.request.args.get('c')
-    quality_filter = flask.request.args.get('f')
-    page = flask.request.args.get('p')
-    if page:
-        page = int(page)
+    req_args = flask.request.args
 
-    per_page = app.config.get('RESULTS_PER_PAGE')
-    if not per_page:
-        per_page = DEFAULT_PER_PAGE
+    search_term = chain_get(req_args, 'q', 'term')
+
+    sort_key = req_args.get('s')
+    sort_order = req_args.get('o')
+
+    category = chain_get(req_args, 'c', 'cats')
+    quality_filter = chain_get(req_args, 'f', 'filter')
+
+    page_number = chain_get(req_args, 'p', 'page', 'offset')
+    try:
+        page_number = max(1, int(page_number))
+    except (ValueError, TypeError):
+        page_number = 1
+
+    results_per_page = app.config.get('RESULTS_PER_PAGE', DEFAULT_PER_PAGE)
 
     query_args = {
-        'term': term or '',
+        'term': search_term or '',
         'user': user.id,
-        'sort': sort or 'id',
-        'order': order or 'desc',
+        'sort': sort_key or 'id',
+        'order': sort_order or 'desc',
         'category': category or '0_0',
         'quality_filter': quality_filter or '0',
-        'page': page or 1,
+        'page': page_number,
         'rss': False,
-        'per_page': per_page
+        'per_page': results_per_page
     }
 
     if flask.g.user:
         query_args['logged_in_user'] = flask.g.user
-        if flask.g.user.is_admin:  # God mode
+        if flask.g.user.is_moderator:  # God mode
             query_args['admin'] = True
 
     # Use elastic search for term searching
-    rss_query_string = _generate_query_string(term, category, quality_filter, user_name)
+    rss_query_string = _generate_query_string(search_term, category, quality_filter, user_name)
     use_elastic = app.config.get('USE_ELASTIC_SEARCH')
-    if use_elastic and term:
-        query_args['term'] = term
+    if use_elastic and search_term:
+        query_args['term'] = search_term
 
-        max_search_results = app.config.get('ES_MAX_SEARCH_RESULT')
-        if not max_search_results:
-            max_search_results = DEFAULT_MAX_SEARCH_RESULT
+        max_search_results = app.config.get('ES_MAX_SEARCH_RESULT', DEFAULT_MAX_SEARCH_RESULT)
 
         # Only allow up to (max_search_results / page) pages
-        max_page = min(query_args['page'], int(math.ceil(max_search_results / float(per_page))))
+        max_page = min(query_args['page'], int(math.ceil(max_search_results / results_per_page)))
 
         query_args['page'] = max_page
         query_args['max_search_results'] = max_search_results
@@ -295,7 +337,7 @@ def view_user(user_name):
 
         max_results = min(max_search_results, query_results['hits']['total'])
         # change p= argument to whatever you change page_parameter to or pagination breaks
-        pagination = Pagination(p=query_args['page'], per_page=per_page,
+        pagination = Pagination(p=query_args['page'], per_page=results_per_page,
                                 total=max_results, bs_version=3, page_parameter='p',
                                 display_msg=SERACH_PAGINATE_DISPLAY_MSG)
         return flask.render_template('user.html',
@@ -306,16 +348,14 @@ def view_user(user_name):
                                      user=user,
                                      user_page=True,
                                      rss_filter=rss_query_string,
-                                     level=level,
-                                     admin=admin,
-                                     superadmin=superadmin,
-                                     form=form)
+                                     level=user_level,
+                                     admin_form=admin_form)
     # Similar logic as home page
     else:
         if use_elastic:
             query_args['term'] = ''
         else:
-            query_args['term'] = term or ''
+            query_args['term'] = search_term or ''
         query = search_db(**query_args)
         return flask.render_template('user.html',
                                      use_elastic=False,
@@ -324,10 +364,8 @@ def view_user(user_name):
                                      user=user,
                                      user_page=True,
                                      rss_filter=rss_query_string,
-                                     level=level,
-                                     admin=admin,
-                                     superadmin=superadmin,
-                                     form=form)
+                                     level=user_level,
+                                     admin_form=admin_form)
 
 
 @app.template_filter('rfc822')
@@ -340,9 +378,10 @@ def _jinja2_filter_rfc822(datestr, fmt=None):
     return formatdate(float(datetime.strptime(datestr, '%Y-%m-%dT%H:%M:%S').strftime('%s')))
 
 
-def render_rss(label, query, use_elastic):
+def render_rss(label, query, use_elastic, magnet_links=False):
     rss_xml = flask.render_template('rss.xml',
                                     use_elastic=use_elastic,
+                                    magnet_links=magnet_links,
                                     term=label,
                                     site_url=flask.request.url_root,
                                     torrent_query=query)
@@ -379,7 +418,7 @@ def login():
             return flask.redirect(flask.url_for('login'))
 
         user.last_login_date = datetime.utcnow()
-        user.last_login_ip = ipaddress.ip_address(flask.request.remote_addr).packed
+        user.last_login_ip = ip_address(flask.request.remote_addr).packed
         db.session.add(user)
         db.session.commit()
 
@@ -413,7 +452,7 @@ def register():
     if flask.request.method == 'POST' and form.validate():
         user = models.User(username=form.username.data.strip(),
                            email=form.email.data.strip(), password=form.password.data)
-        user.last_login_ip = ipaddress.ip_address(flask.request.remote_addr).packed
+        user.last_login_ip = ip_address(flask.request.remote_addr).packed
         db.session.add(user)
         db.session.commit()
 
@@ -441,13 +480,7 @@ def profile():
 
     form = forms.ProfileForm(flask.request.form)
 
-    level = 'Regular'
-    if flask.g.user.is_admin:
-        level = 'Moderator'
-    if flask.g.user.is_superadmin:  # check this second because we can be admin AND superadmin
-        level = 'Administrator'
-    elif flask.g.user.is_trusted:
-        level = 'Trusted'
+    level = ['Regular', 'Trusted', 'Moderator', 'Administrator'][flask.g.user.level]
 
     if flask.request.method == 'POST' and form.validate():
         user = flask.g.user
@@ -462,7 +495,7 @@ def profile():
                 return flask.redirect('/profile')
             user.email = form.email.data
             flask.flash(flask.Markup(
-                '<strong>Email successfully changed!</strong>'), 'info')
+                '<strong>Email successfully changed!</strong>'), 'success')
         if new_password:
             if form.current_password.data != user.password_hash:
                 flask.flash(flask.Markup(
@@ -470,7 +503,7 @@ def profile():
                 return flask.redirect('/profile')
             user.password_hash = form.new_password.data
             flask.flash(flask.Markup(
-                '<strong>Password successfully changed!</strong>'), 'info')
+                '<strong>Password successfully changed!</strong>'), 'success')
 
         db.session.add(user)
         db.session.commit()
@@ -478,9 +511,12 @@ def profile():
         flask.g.user = user
         return flask.redirect('/profile')
 
-    current_email = models.User.by_id(flask.g.user.id).email
+    _user = models.User.by_id(flask.g.user.id)
+    username = _user.username
+    current_email = _user.email
 
-    return flask.render_template('profile.html', form=form, email=current_email, level=level)
+    return flask.render_template('profile.html', form=form, name=username, email=current_email,
+                                 level=level)
 
 
 @app.route('/user/activate/<payload>')
@@ -508,42 +544,48 @@ def activate_user(payload):
 def _create_upload_category_choices():
     ''' Turns categories in the database into a list of (id, name)s '''
     choices = [('', '[Select a category]')]
-    for main_cat in models.MainCategory.query.order_by(models.MainCategory.id):
-        choices.append((main_cat.id_as_string, main_cat.name, True))
-        for sub_cat in main_cat.sub_categories:
-            choices.append((sub_cat.id_as_string, ' - ' + sub_cat.name))
+    id_map = get_category_id_map()
+
+    for key in sorted(id_map.keys()):
+        cat_names = id_map[key]
+        is_main_cat = key.endswith('_0')
+
+        # cat_name = is_main_cat and cat_names[0] or (' - ' + cat_names[1])
+        cat_name = ' - '.join(cat_names)
+        choices.append((key, cat_name, is_main_cat))
     return choices
 
 
 @app.route('/upload', methods=['GET', 'POST'])
 def upload():
-    form = forms.UploadForm(CombinedMultiDict((flask.request.files, flask.request.form)))
-    #print('{0} - {1}'.format(flask.request.files, flask.request.form))
-    form.category.choices = _create_upload_category_choices()
-    if flask.request.method == 'POST' and form.validate():
-        torrent = backend.handle_torrent_upload(form, flask.g.user)
+    upload_form = forms.UploadForm(CombinedMultiDict((flask.request.files, flask.request.form)))
+    upload_form.category.choices = _create_upload_category_choices()
+
+    if flask.request.method == 'POST' and upload_form.validate():
+        torrent = backend.handle_torrent_upload(upload_form, flask.g.user)
 
         return flask.redirect('/view/' + str(torrent.id))
     else:
         # If we get here with a POST, it means the form data was invalid: return a non-okay status
         status_code = 400 if flask.request.method == 'POST' else 200
-        return flask.render_template('upload.html', form=form, user=flask.g.user), status_code
+        return flask.render_template('upload.html', upload_form=upload_form), status_code
 
 
 @app.route('/view/<int:torrent_id>')
 def view_torrent(torrent_id):
     torrent = models.Torrent.by_id(torrent_id)
 
+    viewer = flask.g.user
+
     if not torrent:
         flask.abort(404)
 
-    if torrent.deleted and (not flask.g.user or not flask.g.user.is_admin):
+    # Only allow admins see deleted torrents
+    if torrent.deleted and not (viewer and viewer.is_moderator):
         flask.abort(404)
 
-    if flask.g.user:
-        can_edit = flask.g.user is torrent.user or flask.g.user.is_admin
-    else:
-        can_edit = False
+    # Only allow owners and admins to edit torrents
+    can_edit = viewer and (viewer is torrent.user or viewer.is_moderator)
 
     files = None
     if torrent.filelist:
@@ -551,6 +593,7 @@ def view_torrent(torrent_id):
 
     return flask.render_template('view.html', torrent=torrent,
                                  files=files,
+                                 viewer=viewer,
                                  can_edit=can_edit)
 
 
@@ -559,15 +602,18 @@ def edit_torrent(torrent_id):
     torrent = models.Torrent.by_id(torrent_id)
     form = forms.EditForm(flask.request.form)
     form.category.choices = _create_upload_category_choices()
-    category = str(torrent.main_category_id) + "_" + str(torrent.sub_category_id)
+
+    editor = flask.g.user
 
     if not torrent:
         flask.abort(404)
 
-    if torrent.deleted and (not flask.g.user or not flask.g.user.is_admin):
+    # Only allow admins edit deleted torrents
+    if torrent.deleted and not (editor and editor.is_moderator):
         flask.abort(404)
 
-    if not flask.g.user or (flask.g.user is not torrent.user and not flask.g.user.is_admin):
+    # Only allow torrent owners or admins edit torrents
+    if not editor or not (editor is torrent.user or editor.is_moderator):
         flask.abort(403)
 
     if flask.request.method == 'POST' and form.validate():
@@ -577,36 +623,43 @@ def edit_torrent(torrent_id):
         torrent.display_name = (form.display_name.data or '').strip()
         torrent.information = (form.information.data or '').strip()
         torrent.description = (form.description.data or '').strip()
-        if flask.g.user.is_admin:
-            torrent.deleted = form.is_deleted.data
+
         torrent.hidden = form.is_hidden.data
         torrent.remake = form.is_remake.data
         torrent.complete = form.is_complete.data
         torrent.anonymous = form.is_anonymous.data
+
+        if editor.is_trusted:
+            torrent.trusted = form.is_trusted.data
+        if editor.is_moderator:
+            torrent.deleted = form.is_deleted.data
 
         db.session.commit()
 
         flask.flash(flask.Markup(
             'Torrent has been successfully edited! Changes might take a few minutes to show up.'), 'info')
 
-        return flask.redirect('/view/' + str(torrent_id))
+        return flask.redirect(flask.url_for('view_torrent', torrent_id=torrent.id))
     else:
-        # Setup form with pre-formatted form.
-        form.category.data = category
-        form.display_name.data = torrent.display_name
-        form.information.data = torrent.information
-        form.description.data = torrent.description
-        form.is_hidden.data = torrent.hidden
-        if flask.g.user.is_admin:
+        if flask.request.method != 'POST':
+            # Fill form data only if the POST didn't fail
+            form.category.data = torrent.sub_category.id_as_string
+            form.display_name.data = torrent.display_name
+            form.information.data = torrent.information
+            form.description.data = torrent.description
+
+            form.is_hidden.data = torrent.hidden
+            form.is_remake.data = torrent.remake
+            form.is_complete.data = torrent.complete
+            form.is_anonymous.data = torrent.anonymous
+
+            form.is_trusted.data = torrent.trusted
             form.is_deleted.data = torrent.deleted
-        form.is_remake.data = torrent.remake
-        form.is_complete.data = torrent.complete
-        form.is_anonymous.data = torrent.anonymous
 
         return flask.render_template('edit.html',
                                      form=form,
                                      torrent=torrent,
-                                     admin=flask.g.user.is_admin)
+                                     editor=editor)
 
 
 @app.route('/view/<int:torrent_id>/magnet')
@@ -681,11 +734,22 @@ def send_verification_email(to_address, activ_link):
     server.quit()
 
 
-def _create_user_class_choices():
+def _create_user_class_choices(user):
     choices = [('regular', 'Regular')]
-    if flask.g.user and flask.g.user.is_superadmin:
-        choices.append(('trusted', 'Trusted'))
-    return choices
+    default = 'regular'
+    if flask.g.user:
+        if flask.g.user.is_moderator:
+            choices.append(('trusted', 'Trusted'))
+        if flask.g.user.is_superadmin:
+            choices.append(('moderator', 'Moderator'))
+
+        if user:
+            if user.is_moderator:
+                default = 'moderator'
+            elif user.is_trusted:
+                default = 'trusted'
+
+    return default, choices
 
 
 # #################################### STATIC PAGES ####################################

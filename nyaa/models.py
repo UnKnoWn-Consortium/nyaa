@@ -6,8 +6,10 @@ from sqlalchemy import func, ForeignKeyConstraint, Index
 from sqlalchemy_utils import ChoiceType, EmailType, PasswordType
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy_fulltext import FullText
+from ipaddress import ip_address
 
 import re
+import base64
 from markupsafe import escape as escape_markup
 from urllib.parse import unquote as unquote_url
 
@@ -60,6 +62,7 @@ class Torrent(db.Model):
     encoding = db.Column(db.String(length=32), nullable=False)
     flags = db.Column(db.Integer, default=0, nullable=False, index=True)
     uploader_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    uploader_ip = db.Column(db.Binary(length=16), default=None, nullable=True)
     has_torrent = db.Column(db.Boolean, nullable=False, default=False)
 
     created_time = db.Column(db.DateTime(timezone=False), default=datetime.utcnow, nullable=False)
@@ -88,10 +91,14 @@ class Torrent(db.Model):
                                    primaryjoin=(
                                        "and_(SubCategory.id == foreign(Torrent.sub_category_id), "
                                        "SubCategory.main_category_id == Torrent.main_category_id)"))
-    info = db.relationship('TorrentInfo', uselist=False, back_populates='torrent')
-    filelist = db.relationship('TorrentFilelist', uselist=False, back_populates='torrent')
-    stats = db.relationship('Statistic', uselist=False, back_populates='torrent', lazy='joined')
-    trackers = db.relationship('TorrentTrackers', uselist=True, lazy='joined')
+    info = db.relationship('TorrentInfo', uselist=False,
+                           cascade="all, delete-orphan", back_populates='torrent')
+    filelist = db.relationship('TorrentFilelist', uselist=False,
+                               cascade="all, delete-orphan", back_populates='torrent')
+    stats = db.relationship('Statistic', uselist=False,
+                            cascade="all, delete-orphan", back_populates='torrent', lazy='joined')
+    trackers = db.relationship('TorrentTrackers', uselist=True,
+                               cascade="all, delete-orphan", lazy='joined')
 
     def __repr__(self):
         return '<{0} #{1.id} \'{1.display_name}\' {1.filesize}b>'.format(type(self).__name__, self)
@@ -122,8 +129,21 @@ class Torrent(db.Model):
         return escape_markup(self.information)
 
     @property
+    def info_hash_as_b32(self):
+        return base64.b32encode(self.info_hash).decode('utf-8')
+
+    @property
+    def info_hash_as_hex(self):
+        return self.info_hash.hex()
+
+    @property
     def magnet_uri(self):
         return create_magnet(self)
+
+    @property
+    def uploader_ip_string(self):
+        if self.uploader_ip:
+            return str(ip_address(self.uploader_ip))
 
     @property
     def anonymous(self):
@@ -293,18 +313,14 @@ class SubCategory(db.Model):
         return '_'.join(str(x) for x in self.get_category_ids())
 
     @classmethod
-    def by_id(cls, id):
-        return cls.query.get(id)
-
-    @classmethod
     def by_category_ids(cls, main_cat_id, sub_cat_id):
-        return cls.query.filter(cls.id == sub_cat_id, cls.main_category_id == main_cat_id).first()
+        return cls.query.get((sub_cat_id, main_cat_id))
 
 
 class UserLevelType(IntEnum):
     REGULAR = 0
     TRUSTED = 1
-    ADMIN = 2
+    MODERATOR = 2
     SUPERADMIN = 3
 
 
@@ -353,6 +369,11 @@ class User(db.Model):
         ]
         return all(checks)
 
+    @property
+    def ip_string(self):
+        if self.last_login_ip:
+            return str(ip_address(self.last_login_ip))
+
     @classmethod
     def by_id(cls, id):
         return cls.query.get(id)
@@ -372,16 +393,16 @@ class User(db.Model):
         return cls.by_username(username_or_email) or cls.by_email(username_or_email)
 
     @property
-    def is_admin(self):
-        return self.level is UserLevelType.ADMIN or self.level is UserLevelType.SUPERADMIN
+    def is_moderator(self):
+        return self.level >= UserLevelType.MODERATOR
 
     @property
     def is_superadmin(self):
-        return self.level is UserLevelType.SUPERADMIN
+        return self.level == UserLevelType.SUPERADMIN
 
     @property
     def is_trusted(self):
-        return self.level is UserLevelType.TRUSTED
+        return self.level >= UserLevelType.TRUSTED
 
 
 # class Session(db.Model):
